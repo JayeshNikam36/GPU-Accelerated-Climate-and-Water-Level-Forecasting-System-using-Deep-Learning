@@ -98,6 +98,21 @@ class DataLoader:
             if 'ds' in locals():
                 logger.info(f"Available variables: {list(ds.variables)}")
             raise
+    def load_nasa_multi(self, folder_path: str, lat: float = 40.728, lon: float = -74.078) -> cudf.DataFrame:
+        """Load and concatenate all .nc4 files in a folder."""
+        import glob
+        files = glob.glob(os.path.join(folder_path, "*.nc4"))
+        if not files:
+            raise FileNotFoundError(f"No .nc4 files in {folder_path}")
+
+        dfs = []
+        for f in files:
+            df_day = self.load_nasa_precip(f, lat, lon)
+            dfs.append(df_day)
+
+        combined = cudf.concat(dfs).sort_values('timestamp').reset_index(drop=True)
+        logger.info(f"Combined {len(combined)} rows from {len(files)} NASA files")
+        return combined
 
     def load_all(self, usgs_file: str, noaa_file: str = None, nasa_file: str = None) -> Dict[str, cudf.DataFrame]:
         """Load all sources and return dict of DataFrames. 

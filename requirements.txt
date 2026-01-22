@@ -12,3 +12,5 @@ scipy
 diskcache
 ipykernel
 dotenv
+torch
+matplotlib
