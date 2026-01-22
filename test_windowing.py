@@ -1,13 +1,15 @@
-# test_windowing.py
-from src.preprocessing.loader import DataLoader
-from src.preprocessing.windowing import create_sequences
-from src.preprocessing.normalization import GPUNormalizer
 import logging
 import cudf
 import cupy as cp
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+
+# Internal project imports
+from src.preprocessing.loader import DataLoader
+from src.preprocessing.windowing import create_sequences
+from src.preprocessing.normalization import GPUNormalizer
+from src.models.simple_lstm import train_model
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,77 +19,56 @@ def main():
     print("Full Preprocessing + Training + Evaluation Pipeline (GPU)")
     print("=" * 80)
 
-    # CONFIG
+    # --- 1. CONFIGURATION ---
     usgs_file   = "data/raw/usgs/01388500_2025-01-01_to_2026-01-20.json"
     noaa_file   = "data/raw/noaa/USW00014734_2025-01-01_to_2026-01-20.json"
     nasa_folder = "data/raw/nasa/GPM_3IMERGDF"
 
-    lookback   = 96
-    horizon    = 12              # ← forecasting 12 steps ahead
-    stride     = 12              # reasonable speed
-    batch_size = 64
-    epochs     = 100
-    val_split  = 0.2
-    patience   = 10
+    lookback, horizon, stride = 96, 12, 12
+    batch_size, epochs = 64, 100
+    val_split, patience = 0.2, 10
 
-    # Load
+    # --- 2. DATA LOADING & MERGING ---
     loader = DataLoader(use_gpu=True)
-
-    print("Loading USGS and NOAA...")
     dfs = loader.load_all(usgs_file=usgs_file, noaa_file=noaa_file)
-
-    print(f"USGS shape: {dfs['usgs'].shape}")
-    if 'noaa' in dfs:
-        print(f"NOAA shape: {dfs['noaa'].shape}")
-
-    print("\nLoading NASA precipitation files...")
     dfs['nasa'] = loader.load_nasa_multi(nasa_folder)
-    if 'nasa' in dfs:
-        print(f"NASA combined shape: {dfs['nasa'].shape}")
-
-    # Merge
-    print("\nMerging sources (forward-fill)...")
+    
     merged_df = loader.merge_sources(dfs['usgs'], dfs.get('noaa'), dfs.get('nasa'))
-    print("Merged shape:", merged_df.shape)
-    print("Columns:", list(merged_df.columns))
+    logger.info(f"Merged shape: {merged_df.shape}")
 
-    # Windowing - predict MEAN of next 12 hours
-    print(f"\nCreating sequences (predict MEAN of next {horizon} steps)...")
+    # --- 3. WINDOWING ---
+    # We predict the MEAN of the next 'horizon' steps
     X, y = create_sequences(
         merged_df,
         target_col='gage_height_ft',
-        timestamp_col='timestamp',
-        lookback=lookback,
-        horizon=48,
-        feature_cols=['gage_height_ft', 'precip_mm', 'AWND'],           # ← pure autoregressive for now
+        lookback=96,
+        horizon=12,
+        feature_cols=['gage_height_ft', 'AWND', 'precip_mm'], # Pure Autoregressive
         stride=stride
     )
-    print("X shape:", X.shape)
-    print("y shape (mean over horizon):", y.shape)
 
-    # Normalization (per feature - here only 1)
-    print("\nNormalizing each feature independently...")
+    # --- 4. NORMALIZATION (CRITICAL FIX) ---
+    # Normalize Inputs (X)
     X_norm = cp.zeros_like(X)
     for f in range(X.shape[2]):
-        col = X[:, :, f].ravel()[:, None]
-        col_df = cudf.DataFrame(col, columns=[f'f{f}'])
+        col_df = cudf.DataFrame(X[:, :, f].ravel()[:, None], columns=['feat'])
         norm = GPUNormalizer(method='minmax')
-        norm.fit(col_df, col_df.columns)
-        norm_col = norm.transform(col_df, col_df.columns).values.ravel()
-        X_norm[:, :, f] = norm_col.reshape(X.shape[0], X.shape[1])
+        norm.fit(col_df, ['feat'])
+        X_norm[:, :, f] = norm.transform(col_df, ['feat']).values.ravel().reshape(X.shape[0], X.shape[1])
 
-    print("Normalized X shape:", X_norm.shape)
-    print("First window sample:\n", X_norm[0][:5].get())
+    # Normalize Targets (y) - THIS FIXES THE "PERFECT PREDICTION" ISSUE
+    y_normalizer = GPUNormalizer(method='minmax')
+    y_df = cudf.DataFrame(y.reshape(-1, 1), columns=['target'])
+    y_normalizer.fit(y_df, ['target'])
+    y_norm = y_normalizer.transform(y_df, ['target']).values.ravel()
 
-    # Training
-    print("\nStarting LSTM training...")
-    from src.models.simple_lstm import train_model
-
-    X_cpu = X_norm.get()
-    y_cpu = y.get() if hasattr(y, 'get') else y
+    # --- 5. TRAINING ---
+    # Move to CPU for the PyTorch DataLoader (handles GPU transfer internally)
+    X_train_in = X_norm.get()
+    y_train_in = y_norm.get()
 
     model = train_model(
-        X_cpu, y_cpu,
+        X_train_in, y_train_in,
         epochs=epochs,
         batch_size=batch_size,
         val_split=val_split,
@@ -95,75 +76,47 @@ def main():
         device='cuda'
     )
 
-    # Evaluation
-    print("\nEvaluating on validation set...")
+    # --- 6. EVALUATION & INVERSE TRANSFORM ---
     model.eval()
-
-    val_size = int(val_split * len(y))
-    X_val = X[-val_size:]
-    y_val = y[-val_size:]
+    val_size = int(val_split * len(y_norm))
+    
+    # Take the last 20% chronologically
+    X_val_norm = X_norm[-val_size:]
+    y_val_norm = y_norm[-val_size:]
 
     with torch.no_grad():
-        X_val_tensor = torch.as_tensor(X_val.get(), dtype=torch.float32).to('cuda')
-        preds_val = model(X_val_tensor).squeeze().cpu().numpy()
+        X_val_tensor = torch.as_tensor(X_val_norm.get(), dtype=torch.float32).to('cuda')
+        preds_norm = model(X_val_tensor).squeeze().cpu().numpy()
 
-    actual_val = y_val.get() if hasattr(y_val, 'get') else y_val
-    actual_val = np.asarray(actual_val).ravel()
-    preds_val  = preds_val.ravel()
+    # Inverse Transform Predictions
+    pred_df = cudf.DataFrame(preds_norm.reshape(-1, 1), columns=['target'])
+    pred_denorm = y_normalizer.inverse_transform(pred_df, ['target'])['target'].to_numpy()
 
-    # Denormalization
-    target_normalizer = GPUNormalizer(method='minmax')
-    target_data = merged_df[['gage_height_ft']].astype('float32')
-    target_normalizer.fit(target_data, columns=['gage_height_ft'])
+    # Inverse Transform Actuals
+    actual_df = cudf.DataFrame(y_val_norm.get().reshape(-1, 1), columns=['target'])
+    actual_denorm = y_normalizer.inverse_transform(actual_df, ['target'])['target'].to_numpy()
 
-    pred_df   = cudf.DataFrame(preds_val.reshape(-1,1), columns=['gage_height_ft'])
-    pred_denorm = target_normalizer.inverse_transform(pred_df, ['gage_height_ft'])['gage_height_ft'].to_numpy()
+    # --- 7. PERSISTENCE BASELINE ---
+    # Baseline: The mean of the next 12h will be exactly the last observed value
+    last_obs_raw = X[-val_size:, -1, 0].get() 
+    
+    # --- 8. METRICS & PLOTTING ---
+    rmse_lstm = np.sqrt(np.mean((pred_denorm - actual_denorm)**2))
+    rmse_persist = np.sqrt(np.mean((last_obs_raw - actual_denorm)**2))
 
-    actual_df   = cudf.DataFrame(actual_val.reshape(-1,1), columns=['gage_height_ft'])
-    actual_denorm = target_normalizer.inverse_transform(actual_df, ['gage_height_ft'])['gage_height_ft'].to_numpy()
+    print(f"\nRESULTS:")
+    print(f"LSTM RMSE: {rmse_lstm:.4f} ft")
+    print(f"Persistence RMSE: {rmse_persist:.4f} ft")
+    print(f"Improvement: {rmse_persist - rmse_lstm:.4f} ft")
 
-    # Metrics
-    rmse_norm = np.sqrt(np.mean((preds_val - actual_val)**2))
-    mae_norm  = np.mean(np.abs(preds_val - actual_val))
-    rmse_orig = np.sqrt(np.mean((pred_denorm - actual_denorm)**2))
-    mae_orig  = np.mean(np.abs(pred_denorm - actual_denorm))
-
-    print(f"Val RMSE (norm): {rmse_norm:.6f}   MAE (norm): {mae_norm:.6f}")
-    print(f"Val RMSE (feet): {rmse_orig:.4f}   MAE (feet): {mae_orig:.4f}")
-
-    # Persistence baseline - last value repeated as prediction
-    last_observed_norm = X_val[:, -1, 0]
-    persist_pred_norm = cp.full_like(y_val, last_observed_norm)   # repeat last value
-
-    persist_df = cudf.DataFrame(persist_pred_norm.reshape(-1,1).get(), columns=['gage_height_ft'])
-    persist_denorm = target_normalizer.inverse_transform(persist_df, ['gage_height_ft'])['gage_height_ft'].to_numpy()
-
-    rmse_persist = np.sqrt(np.mean((persist_denorm - actual_denorm)**2))
-    mae_persist  = np.mean(np.abs(persist_denorm - actual_denorm))
-
-    print(f"Persistence RMSE (feet): {rmse_persist:.4f}")
-    print(f"Persistence MAE  (feet): {mae_persist:.4f}")
-    print(f"LSTM MAE improvement over persistence: {mae_orig - mae_persist:+.4f} ft")
-
-    # Plot
-    val_start_idx = len(merged_df) - val_size - horizon + 1
-    val_timestamps = merged_df['timestamp'].iloc[val_start_idx:val_start_idx + val_size].to_numpy()
-
-    plt.figure(figsize=(14, 6))
-    plt.plot(val_timestamps, actual_denorm, label='Actual (mean next 12h)', color='blue')
-    plt.plot(val_timestamps, pred_denorm, label='LSTM Pred', color='orange', ls='--')
-    plt.plot(val_timestamps, persist_denorm, label='Persistence (last value)', color='green', ls=':')
-    plt.title(f"LSTM vs Persistence – Mean of next {horizon} steps")
-    plt.xlabel("Time")
-    plt.ylabel("Gage Height (ft)")
+    plt.figure(figsize=(12, 6))
+    plt.plot(actual_denorm, label='Actual (Next 12h Mean)', color='black', alpha=0.7)
+    plt.plot(pred_denorm, label='LSTM Forecast', color='blue', linestyle='--')
+    plt.plot(last_obs_raw, label='Persistence Baseline', color='red', linestyle=':', alpha=0.5)
     plt.legend()
-    plt.grid(True)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.savefig("val_predictions_mean_12h.png")
-    print("Plot saved: val_predictions_mean_12h.png")
-
-    print("\nDone!")
+    plt.title("Water Level Forecasting: LSTM vs Baseline")
+    plt.savefig("forecast_comparison.png")
+    print("Plot saved to forecast_comparison.png")
 
 if __name__ == "__main__":
     main()

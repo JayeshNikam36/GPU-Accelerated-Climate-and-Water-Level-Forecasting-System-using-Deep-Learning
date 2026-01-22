@@ -1,10 +1,8 @@
-# src/models/simple_lstm.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from src.data_acquisition.utils import logger
 
 class TimeSeriesDataset(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray):
@@ -18,97 +16,76 @@ class TimeSeriesDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 class SimpleLSTM(nn.Module):
-    def __init__(self, input_size=3, hidden_size=64, num_layers=2, output_size=1):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, output_size=1):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
-        self.fc = nn.Linear(hidden_size, output_size)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_size)
+        )
 
     def forward(self, x):
+        # out: [batch, seq_len, hidden_size]
         out, _ = self.lstm(x)
-        out = self.fc(out[:, -1, :])  # take last timestep
+        # We take the output of the final time step
+        out = self.fc(out[:, -1, :]) 
         return out
 
-def train_model(
-    X: np.ndarray,
-    y: np.ndarray,
-    epochs: int = 100,
-    batch_size: int = 64,
-    lr: float = 0.0003,
-    val_split: float = 0.2,
-    patience: int = 10,
-    min_delta: float = 0.0001,
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
-):
-    dataset = TimeSeriesDataset(X, y)
+def train_model(X, y, epochs=100, batch_size=64, lr=0.001, val_split=0.2, patience=10, device='cuda'):
+    # 1. Chronological Split (No Shuffling!)
+    split_idx = int((1 - val_split) * len(X))
+    X_train, X_val = X[:split_idx], X[split_idx:]
+    y_train, y_val = y[:split_idx], y[split_idx:]
 
-    train_size = int((1 - val_split) * len(dataset))
-    val_size = len(dataset) - train_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    train_ds = TimeSeriesDataset(X_train, y_train)
+    val_ds = TimeSeriesDataset(X_val, y_val)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False)
-    val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    # We shuffle the LOADERS to help convergence, but the DATA SPLIT remains chronological
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
-    model = SimpleLSTM(input_size=X.shape[-1], output_size=1).to(device)
+    model = SimpleLSTM(input_size=X.shape[-1]).to(device)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-6)
     
-    # No verbose argument — compatible with older PyTorch versions
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='min', 
-        factor=0.5, 
-        patience=4
-    )
-
     best_val_loss = float('inf')
-    patience_counter = 0
-
-    logger.info(f"Training LSTM on {device} | Train: {len(train_ds)}, Val: {len(val_ds)}")
+    counter = 0
 
     for epoch in range(epochs):
         model.train()
-        train_loss = 0
+        total_train_loss = 0
         for batch_x, batch_y in train_loader:
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             optimizer.zero_grad()
-            output = model(batch_x)
-            loss = criterion(output.squeeze(), batch_y)
+            pred = model(batch_x)
+            loss = criterion(pred.squeeze(), batch_y)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
-
-        avg_train_loss = train_loss / len(train_loader)
+            total_train_loss += loss.item()
 
         model.eval()
-        val_loss = 0
+        total_val_loss = 0
         with torch.no_grad():
             for batch_x, batch_y in val_loader:
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-                output = model(batch_x)
-                val_loss += criterion(output.squeeze(), batch_y).item()
+                val_pred = model(batch_x)
+                total_val_loss += criterion(val_pred.squeeze(), batch_y).item()
 
-        avg_val_loss = val_loss / len(val_loader)
-
-        # Step scheduler
-        scheduler.step(avg_val_loss)
-
-        # Optional: print learning rate change if desired
-        if scheduler.optimizer.param_groups[0]['lr'] < lr * 0.9:
-            logger.info(f"Learning rate reduced to {scheduler.optimizer.param_groups[0]['lr']:.6f}")
+        avg_train = total_train_loss / len(train_loader)
+        avg_val = total_val_loss / len(val_loader)
 
         if (epoch + 1) % 5 == 0:
-            logger.info(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+            print(f"Epoch {epoch+1} | Train: {avg_train:.6f} | Val: {avg_val:.6f}")
 
-        if avg_val_loss < best_val_loss - min_delta:
-            best_val_loss = avg_val_loss
-            patience_counter = 0
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
             torch.save(model.state_dict(), "best_lstm_model.pth")
-            logger.info(f"New best val loss: {best_val_loss:.6f} → saved")
+            counter = 0
         else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                logger.info(f"Early stopping at epoch {epoch+1}")
+            counter += 1
+            if counter >= patience:
+                print("Early stopping triggered.")
                 break
 
-    logger.info("Training complete")
     return model
