@@ -1,0 +1,51 @@
+# Data directories
+data/raw/
+data/processed/
+data/cache/
+experiments/runs/
+experiments/models/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+.venv/
+rapids-venv/
+.rapids-venv/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model files (large)
+*.pth
+*.pt
+*.onnx
+*.trt
+*.h5
+*.ckpt
+
+# Environment
+.env
+.env.local
+.rapids-venv
+
+# Conda installers
+Miniconda*.sh
+Anaconda*.sh
+Miniconda*.sh.1
+Anaconda*.sh.1

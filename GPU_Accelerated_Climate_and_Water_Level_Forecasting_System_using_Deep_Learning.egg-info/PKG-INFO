@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: GPU-Accelerated-Climate-and-Water-Level-Forecasting-System-using-Deep-Learning
+Version: 0.1.0
+Summary: GPU-accelerated system for forecasting climate variables and water levels using advanced deep learning models
+Author: Jayesh, Mahadi
+License-File: LICENSE
+Requires-Dist: requests
+Requires-Dist: tenacity
+Requires-Dist: pyyaml
+Requires-Dist: python-dotenv
+Requires-Dist: pandas
+Requires-Dist: joblib
+Requires-Dist: pytest
+Requires-Dist: pytest-mock
+Dynamic: author
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary

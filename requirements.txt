@@ -1,0 +1,14 @@
+requests
+tenacity
+pyyaml
+python-dotenv
+pandas
+joblib
+pytest
+pytest-mock
+earthaccess
+pandas
+scipy
+diskcache
+ipykernel
+dotenv

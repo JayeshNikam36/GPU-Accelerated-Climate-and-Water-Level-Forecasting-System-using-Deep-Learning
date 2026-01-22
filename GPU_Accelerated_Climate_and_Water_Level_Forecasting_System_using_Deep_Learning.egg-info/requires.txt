@@ -1,0 +1,8 @@
+requests
+tenacity
+pyyaml
+python-dotenv
+pandas
+joblib
+pytest
+pytest-mock
