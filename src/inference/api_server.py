@@ -7,6 +7,7 @@ import cudf
 import joblib
 import requests
 from typing import List
+import onnxruntime as ort
 
 from src.models.simple_lstm import load_model, predict_future
 from src.preprocessing.normalization import GPUNormalizer
@@ -21,27 +22,23 @@ app = FastAPI(
 model = None
 y_normalizer = None
 
+ort_session = None
+
 @app.on_event("startup")
 async def startup_event():
-    global model, y_normalizer
-    print("API server starting up...")
-    
+    global model, y_normalizer, ort_session
+    print("Loading model and normalizer...")
     try:
-        print("  Loading LSTM model...")
         model = load_model("best_lstm_model.pth", input_size=3)
-        print("  Model loaded successfully.")
-        
-        print("  Loading normalizer...")
         y_normalizer = joblib.load("y_normalizer.pkl")
-        print("  Normalizer loaded successfully.")
         
-    except FileNotFoundError as e:
-        print(f"  ERROR: File not found - {e}")
-        print("  Make sure 'best_lstm_model.pth' and 'y_normalizer.pkl' exist in the project root.")
-        raise RuntimeError("Required model or normalizer file missing.")
-    
+        # Load ONNX for faster inference
+        print("Loading ONNX Runtime session...")
+        ort_session = ort.InferenceSession("lstm_model.onnx", providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        print(f"ONNX using provider: {ort_session.get_providers()[0]}")
+        
     except Exception as e:
-        print(f"  Unexpected startup error: {e}")
+        print(f"Startup error: {e}")
         raise
     
     print("API startup complete — ready to serve requests.")
@@ -68,7 +65,7 @@ async def forecast(request: ForecastRequest):
 
         last_seq = np.array(request.last_sequence, dtype=np.float32).reshape(1, 96, 3)
 
-        future_norm = predict_future(model, last_seq, steps=12)
+        future_norm = ort_session.run(None, {'input': last_seq})[0].flatten()
 
         future_df = cudf.DataFrame(future_norm.reshape(-1, 1), columns=['target'])
         future_denorm = y_normalizer.inverse_transform(future_df, ['target'])['target'].to_numpy()
@@ -97,7 +94,7 @@ async def forecast_auto():
         last_seq = np.array(last_seq_list, dtype=np.float32).reshape(1, 96, 3)
 
         # Predict next 12 steps
-        future_norm = predict_future(model, last_seq, steps=12)
+        future_norm = ort_session.run(None, {'input': last_seq})[0].flatten()
 
         # Denormalize
         future_df = cudf.DataFrame(future_norm.reshape(-1, 1), columns=['target'])

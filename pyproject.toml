@@ -1,0 +1,3 @@
+[wsl2]
+memory=8GB  # Or 75% of your total RAM
+swap=16GB

@@ -157,13 +157,17 @@ def predict_future(model, last_sequence: np.ndarray, steps: int = 12, device='cu
     model.eval()
     predictions = []
     current = torch.tensor(last_sequence, dtype=torch.float32).to(device)
-
+    n_features = current.shape[2]
     with torch.no_grad():
         for _ in range(steps):
             pred = model(current).item()  # scalar prediction
             predictions.append(pred)
             # Shift window: remove oldest timestep, append new prediction
-            current = torch.cat((current[:, 1:, :], torch.tensor([[[pred]]], device=device)), dim=1)
+            new_step = torch.zeros((1, 1, n_features), device=device)
+            new_step[0, 0, 0] = pred 
+            
+            # Shift window: remove oldest timestep, append new prediction vector
+            current = torch.cat((current[:, 1:, :], new_step), dim=1)
 
     return np.array(predictions)
 

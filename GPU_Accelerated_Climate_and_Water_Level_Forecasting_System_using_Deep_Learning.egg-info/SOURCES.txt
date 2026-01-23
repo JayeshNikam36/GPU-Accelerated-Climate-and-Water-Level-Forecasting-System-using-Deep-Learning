@@ -39,6 +39,7 @@ src/models/attention.py
 src/models/base_model.py
 src/models/lstm_model.py
 src/models/probabilistic.py
+src/models/simple_lstm.py
 src/models/transformer_model.py
 src/models/utils.py
 src/preprocessing/__init__.py

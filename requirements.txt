@@ -16,3 +16,6 @@ torch
 matplotlib
 fastapi
 uvicorn
+onnx
+onnxruntime
+tensorrt

@@ -6,3 +6,15 @@ pandas
 joblib
 pytest
 pytest-mock
+earthaccess
+pandas
+scipy
+diskcache
+ipykernel
+dotenv
+torch
+matplotlib
+fastapi
+uvicorn
+onnx
+onnxruntime

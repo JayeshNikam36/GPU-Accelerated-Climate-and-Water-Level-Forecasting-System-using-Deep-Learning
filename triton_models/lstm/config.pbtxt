@@ -1,0 +1,23 @@
+name: "lstm"
+platform: "onnxruntime_onnx"
+max_batch_size: 128
+input [
+  {
+    name: "input"
+    data_type: TYPE_FP32
+    dims: [ -1, 96, 3 ]  # dynamic batch, fixed seq=96, feat=3
+  }
+]
+output [
+  {
+    name: "output"
+    data_type: TYPE_FP32
+    dims: [ -1, 1 ]
+  }
+]
+instance_group [
+  {
+    kind: KIND_GPU
+    count: 1
+  }
+]
