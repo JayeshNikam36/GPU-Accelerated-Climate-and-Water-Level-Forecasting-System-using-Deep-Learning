@@ -4,11 +4,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
+import yaml
 import logging
 
 logger = logging.getLogger(__name__)
 
 class TimeSeriesDataset(Dataset):
+    """Simple dataset for time-series data."""
     def __init__(self, X: np.ndarray, y: np.ndarray):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32)
@@ -20,12 +22,27 @@ class TimeSeriesDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 class SimpleLSTM(nn.Module):
-    def __init__(self, input_size=3, hidden_size=128, num_layers=2, output_size=1, dropout=0.2):
+    """
+    LSTM with self-attention for better long-range dependency capture.
+    """
+    def __init__(self, input_size=3, hidden_size=128, num_layers=2, dropout=0.2, output_size=1):
         super().__init__()
         self.lstm = nn.LSTM(
-            input_size, hidden_size, num_layers,
-            batch_first=True, dropout=dropout if num_layers > 1 else 0
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
         )
+
+        # Self-attention layer after LSTM
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=8,  # hidden_size must be divisible by num_heads (128/8=16)
+            dropout=dropout,
+            batch_first=True
+        )
+
         self.fc = nn.Sequential(
             nn.Linear(hidden_size, 64),
             nn.ReLU(),
@@ -33,39 +50,58 @@ class SimpleLSTM(nn.Module):
         )
 
     def forward(self, x):
-        out, _ = self.lstm(x)          # out: (batch, seq_len, hidden)
-        out = self.fc(out[:, -1, :])   # take last timestep
-        return out.squeeze(-1)         # (batch,)
+        # x: (batch, seq_len, input_size)
+        lstm_out, _ = self.lstm(x)  # (batch, seq_len, hidden)
+
+        # Self-attention: query=key=value = lstm_out
+        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
+
+        # Take the output of the last timestep
+        out = self.fc(attn_out[:, -1, :])  # (batch, output_size)
+        return out.squeeze(-1)  # (batch,)
 
 def train_model(
     X: np.ndarray,
     y: np.ndarray,
-    epochs: int = 100,
-    batch_size: int = 64,
-    lr: float = 0.001,
-    val_split: float = 0.2,
-    patience: int = 10,
+    config_path: str = "configs/models/lstm_config.yaml",
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 ):
+    """
+    Train the LSTM model using config from YAML.
+    """
+    # Load configuration
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    model_cfg = config['model']
+    train_cfg = config['training']
+
     dataset = TimeSeriesDataset(X, y)
 
-    train_size = int((1 - val_split) * len(dataset))
+    train_size = int((1 - train_cfg['val_split']) * len(dataset))
     val_size = len(dataset) - train_size
     train_ds, val_ds = random_split(dataset, [train_size, val_size])
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=train_cfg['batch_size'], shuffle=True)
+    val_loader   = DataLoader(val_ds,   batch_size=train_cfg['batch_size'], shuffle=False)
 
-    model = SimpleLSTM(input_size=X.shape[-1]).to(device)
+    model = SimpleLSTM(
+        input_size=model_cfg['input_size'],
+        hidden_size=model_cfg['hidden_size'],
+        num_layers=model_cfg['num_layers'],
+        dropout=model_cfg['dropout'],
+        output_size=model_cfg['output_size']
+    ).to(device)
+
     criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=train_cfg['lr'], weight_decay=1e-5)
 
     best_val_loss = float('inf')
     patience_counter = 0
 
     logger.info(f"Training on {device} | Train: {len(train_ds)}, Val: {len(val_ds)}")
 
-    for epoch in range(epochs):
+    for epoch in range(train_cfg['epochs']):
         model.train()
         train_loss = 0.0
         for batch_x, batch_y in train_loader:
@@ -91,16 +127,16 @@ def train_model(
         val_loss /= len(val_ds)
 
         if (epoch + 1) % 5 == 0:
-            logger.info(f"Epoch {epoch+1}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+            logger.info(f"Epoch {epoch+1}/{train_cfg['epochs']} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), "best_lstm_model.pth")
-            logger.info(f"New best val loss: {val_loss:.6f} — model saved")
+            logger.info(f"New best val loss: {val_loss:.6f} — saved model")
             patience_counter = 0
         else:
             patience_counter += 1
-            if patience_counter >= patience:
+            if patience_counter >= train_cfg['patience']:
                 logger.info(f"Early stopping at epoch {epoch+1}")
                 break
 
@@ -109,35 +145,30 @@ def train_model(
 
 def predict_future(model, last_sequence: np.ndarray, steps: int = 12, device='cuda'):
     """
-    Recursively predict future steps using the last lookback sequence.
-    last_sequence: shape (1, lookback, n_features)
+    Recursively predict future steps autoregressively.
+    
+    Args:
+        last_sequence: np.ndarray of shape (1, lookback, features)
+        steps: number of future steps to predict
+    
+    Returns:
+        np.ndarray of shape (steps,)
     """
     model.eval()
     predictions = []
-    # Ensure input is (1, seq_len, n_features)
     current = torch.tensor(last_sequence, dtype=torch.float32).to(device)
-    n_features = last_sequence.shape[2]
 
     with torch.no_grad():
         for _ in range(steps):
-            # 1. Predict next gage height
-            pred = model(current).item() 
+            pred = model(current).item()  # scalar prediction
             predictions.append(pred)
-            
-            # 2. Create a new feature vector for this timestep
-            # We put the prediction in index 0 (gage_height) 
-            # and pad the rest with 0 or the last known value
-            new_features = torch.zeros((1, 1, n_features), device=device)
-            new_features[0, 0, 0] = pred 
-            # Optional: carry over last known wind/precip if desired:
-            # new_features[0, 0, 1:] = current[0, -1, 1:] 
-
-            # 3. Shift the window: Drop first, append new
-            current = torch.cat((current[:, 1:, :], new_features), dim=1)
+            # Shift window: remove oldest timestep, append new prediction
+            current = torch.cat((current[:, 1:, :], torch.tensor([[[pred]]], device=device)), dim=1)
 
     return np.array(predictions)
 
 def load_model(file_path="best_lstm_model.pth", input_size=3):
+    """Load saved model weights."""
     model = SimpleLSTM(input_size=input_size)
     model.load_state_dict(torch.load(file_path, map_location='cuda'))
     model.to('cuda')

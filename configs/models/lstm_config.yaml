@@ -1,0 +1,14 @@
+# configs/models/lstm_config.yaml
+model:
+  input_size: 3
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.2
+  output_size: 1
+
+training:
+  epochs: 100
+  batch_size: 64
+  lr: 0.001
+  val_split: 0.2
+  patience: 10

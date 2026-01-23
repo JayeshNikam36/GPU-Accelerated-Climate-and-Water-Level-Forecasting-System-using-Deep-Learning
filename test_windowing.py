@@ -70,15 +70,7 @@ def main():
 
     # === 5. TRAINING ===   
     # This saves the best weights to 'best_lstm_model.pth' automatically
-    model = train_model(
-        X_norm.get(),
-        y_norm.get(),
-        epochs=epochs,
-        batch_size=batch_size,
-        val_split=val_split,
-        patience=patience,
-        device='cuda'
-    )
+    model = train_model(X_norm.get(), y_norm.get(), config_path="configs/models/lstm_config.yaml")
 
     # === 6. EVALUATION ===
     model.eval()
